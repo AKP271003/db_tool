@@ -1,8 +1,10 @@
-from flask import Flask, request, send_file
-import mysql.connector
+from flask import Flask, request, send_file, jsonify
+import pymysql
 import pandas as pd
 import zipfile
 from werkzeug.utils import secure_filename
+from io import BytesIO
+import re
 
 app = Flask(__name__)
 
@@ -16,7 +18,7 @@ database = 'HugeDatabase'
 # Connect to the database
 def connect_db():
     try:
-        connection = mysql.connector.connect(
+        connection = pymysql.connect(
             host=host,
             user=user,
             password=password,
@@ -26,101 +28,117 @@ def connect_db():
             collation='utf8mb4_general_ci'
         )
         return connection
-    except mysql.connector.Error as err:
+    except pymysql.MySQLError as err:
         print(f"Error connecting to database: {err}")
         return None
 
 # Execute SQL queries and return results as a DataFrame
-def execute_query(query):
+def execute_queries(script, case_number):
     connection = connect_db()
     if connection is None:
-        return None
+        return None, ["failed to connect to the database"]
+    
+    results=[]
+    messages=[]
     
     try:
         cursor = connection.cursor()
         
-        # Check if query is a procedure creation
-        if query.upper().startswith('CREATE PROCEDURE'):
-            cursor.execute(query, multi=True)
-            connection.commit()
-            connection.close()
-            return None  # No results for procedure creation
+        # Replace ? with case_number in the script
+        script = script.replace('?', str(case_number))
         
-        # Check if query is a procedure call
-        elif query.upper().startswith('CALL'):
-            cursor.execute(query)
-            results = cursor.fetchall()
-            columns = [desc[0] for desc in cursor.description]
-            df = pd.DataFrame(results, columns=columns)
-            connection.close()
-            return df
-        else:
-            df = pd.read_sql_query(query, connection)
-            connection.close()
-            return df
-    except mysql.connector.Error as err:
-        print(f"Error executing query: {err}")
-        connection.close()
-        return None
+        statements = re.split(r';\s*', script)
+        for statement in statements:
+            statement = statement.strip()
+            if not statement:
+                continue
 
-# Save DataFrame to Excel and zip it
-def save_and_zip(df, filename):
-    df.to_excel(filename, index=False)
-    
-    zip_filename = f"{filename}.zip"
-    with zipfile.ZipFile(zip_filename, 'w') as zip_file:
-        zip_file.write(filename)
-    
-    return zip_filename
+            # Check query execution plan
+            explain_query = f"EXPLAIN {statement}"
+            cursor.execute(explain_query)
+            explain_result = cursor.fetchall()
+            
+            # Log the EXPLAIN result for debugging
+            messages.append(f"EXPLAIN result for '{statement}': {explain_result}")
+            
+            # Check if query reads more than 10,000 rows
+            for row in explain_result:
+                try:
+                    # Check if rows_examined is available and numeric
+                    if len(row) > 9 and isinstance(row[9], int):
+                        rows_examined = row[9]
+                        messages.append(f"Rows examined for '{statement}': {rows_examined}")
+                        if rows_examined > 10000:
+                            messages.append(f"Query aborted: Reads more than 10,000 rows for '{statement}'.")
+                            return results, messages
+                    else:
+                        messages.append(f"Error parsing rows examined for '{statement}': {row}")
+                except Exception as e:
+                    messages.append(f"Error parsing rows examined for '{statement}': {e}")
+            
+            try:
+                cursor.execute(statement)
+                result = cursor.fetchall()
+                if result:
+                    columns = [desc[0] for desc in cursor.description]
+                    df = pd.DataFrame(result, columns=columns)
+                    results.append(df)
+                    messages.append(f"Query executed successfully with results for '{statement}'.")
+                else:
+                    messages.append(f"Query executed successfully with no results for '{statement}'.")
+            except pymysql.MySQLError as err:
+                messages.append(f"Error executing statement '{statement}': {err}")
+
+    finally:
+        connection.close()
+
+    return results, messages
+
 
 # API endpoint to upload queries and download results
 @app.route('/execute_queries', methods=['POST'])
-def execute_queries():
-    # Get the uploaded file
-    file = request.files['file']
+def handle_execute_queries():
+    # Get the uploaded file and case_number
+    file = request.files.get('file')
+    case_number = request.form.get('case_number')
+    if file is None or case_number is None:
+        return jsonify({'error': 'Missing required parameters'}), 400
+    
     filename = secure_filename(file.filename)
     
     # Read queries from the file
-    queries = file.read().decode('utf-8')
+    script = file.read().decode('utf-8')
     
-    # Split queries based on DELIMITER
-    delimiter = '//'
-    queries_list = queries.split(delimiter)
+    results, messages = execute_queries(script, case_number)
+
+    if not results:
+        return jsonify({'messsage': 'No results', "execution_log": messages}), 200
     
-    # Process each query block
-    results = []
+    # Check if results are empty
+    if all(df.empty for df in results):
+        return jsonify({'messsage': 'No data in results', "execution_log": messages}), 200
     
-    for query_block in queries_list:
-        query_block = query_block.strip()
-        if query_block:
-            # Check if it's a procedure creation
-            if query_block.upper().startswith('CREATE PROCEDURE'):
-                # Execute procedure creation directly
-                connection = connect_db()
-                cursor = connection.cursor()
-                cursor.execute(query_block, multi=True)
-                connection.commit()
-                connection.close()
-            else:
-                # Split by semicolon and execute each query
-                for query in query_block.split(';'):
-                    query = query.strip()
-                    if query:
-                        df = execute_query(query)
-                        if df is not None:
-                            results.append(df)
-    
-    if results:
-        combined_result = pd.concat(results, ignore_index=True)
-        
-        # Save to Excel and zip
-        excel_filename = 'query_results.xlsx'
-        zip_filename = save_and_zip(combined_result, excel_filename)
-        
-        # Return the zip file for download
-        return send_file(zip_filename, as_attachment=True)
-    else:
-        return "No results to download."
+    excel_buffer = BytesIO()
+
+    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+        for i, df in enumerate(results, 1):
+            sheet_name = f'Result_{i}'
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    excel_buffer.seek(0)
+
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        zip_file.writestr('query_results.xlsx', excel_buffer.getvalue())
+
+    zip_buffer.seek(0)
+
+    return send_file(
+        zip_buffer,
+        mimetype='application/zip',
+        as_attachment=True,
+        download_name='query_results.zip'
+    )
 
 if __name__ == '__main__':
     app.run(debug=True)
