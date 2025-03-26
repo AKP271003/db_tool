@@ -3,8 +3,10 @@ import pymysql
 import pandas as pd
 import zipfile
 from werkzeug.utils import secure_filename
-from io import BytesIO
+from io import BytesIO, StringIO
 import re
+import os
+import mysql.connector.pooling
 
 app = Flask(__name__)
 
@@ -15,130 +17,158 @@ password = 'password'
 port = 3307
 database = 'HugeDatabase'
 
+# Create a connection pool
+pool = mysql.connector.pooling.MySQLConnectionPool(
+    pool_name="my_pool",
+    pool_size=5,
+    host=host,
+    user=user,
+    password=password,
+    database=database,
+    port=port
+)
+
+QUERIES = """
+SELECT * FROM huge_table WHERE case_number = ?;
+SELECT * FROM huge_table WHERE case_number < ?;
+SELECT * FROM huge_table WHERE case_number > ?;
+"""
+
 # Connect to the database
 def connect_db():
     try:
-        connection = pymysql.connect(
-            host=host,
-            user=user,
-            password=password,
-            port=port,
-            database=database,
-            charset='utf8mb4',
-            collation='utf8mb4_general_ci'
-        )
+        connection = pool.get_connection()
         return connection
-    except pymysql.MySQLError as err:
+    except Exception as err:
         print(f"Error connecting to database: {err}")
         return None
 
 # Execute SQL queries and return results as a DataFrame
-def execute_queries(script, case_number):
+def execute_queries(case_number):
     connection = connect_db()
     if connection is None:
         return None, ["failed to connect to the database"]
     
     results=[]
-    messages=[]
+    execution_log=[]
+    ROW_LIMIT = 10000
     
     try:
         cursor = connection.cursor()
-        
-        # Replace ? with case_number in the script
-        script = script.replace('?', str(case_number))
-        
+        case_number_str = str(case_number)
+        script = QUERIES.replace('?', str(case_number))
         statements = re.split(r';\s*', script)
+
         for statement in statements:
             statement = statement.strip()
             if not statement:
                 continue
 
-            # Check query execution plan
-            explain_query = f"EXPLAIN {statement}"
-            cursor.execute(explain_query)
-            explain_result = cursor.fetchall()
-            
-            # Log the EXPLAIN result for debugging
-            messages.append(f"EXPLAIN result for '{statement}': {explain_result}")
-            
-            # Check if query reads more than 10,000 rows
-            for row in explain_result:
-                try:
-                    # Check if rows_examined is available and numeric
-                    if len(row) > 9 and isinstance(row[9], int):
-                        rows_examined = row[9]
-                        messages.append(f"Rows examined for '{statement}': {rows_examined}")
-                        if rows_examined > 10000:
-                            messages.append(f"Query aborted: Reads more than 10,000 rows for '{statement}'.")
-                            return results, messages
-                    else:
-                        messages.append(f"Error parsing rows examined for '{statement}': {row}")
-                except Exception as e:
-                    messages.append(f"Error parsing rows examined for '{statement}': {e}")
-            
+            query_result = None
+            query_error = None
+            explain_rows = None
+
             try:
+
+                # Check query execution plan
+                explain_query = f"EXPLAIN {statement}"
+                execution_log.append(f"\nAttempting EXPLAIN with: {explain_query}")
+                cursor.execute(explain_query)
+                explain_result = cursor.fetchall()
+                execution_log.append(f"Raw EXPLAIN result: {explain_result}")
+            
+                if not explain_result:
+                    raise ValueError("Empty EXPLAIN result")
+                
+                explain_rows=0
+                for row in explain_result:
+                    if len(row) > 8:
+                        try:
+                            row_estimate = int(row[8]) if row[8] is not None else 0
+                            explain_rows += row_estimate
+                        except (ValueError, TypeError) as e:
+                            execution_log.append(f"Warning: Could not convert row estimate '{row[8]}' to number")
+                            explain_rows = float('inf')
+                
+                execution_log.append(f"EXPLAIN for '{statement}': Estimated rows = {explain_rows}")
+
+                if explain_rows > ROW_LIMIT:
+                    query_error = f"Query aborted: Estimated rows ({explain_rows}) > {ROW_LIMIT}"
+                    execution_log.append(query_error)
+                    results.append({"error": query_error, "query":statement})
+                    continue
+            except Exception as e:
+                query_error = f"EXPLAIN failed for '{statement}': {str(e)}"
+                execution_log.append(query_error)
+                results.append({"error": query_error, "query": statement})
+                continue
+            try:
+                execution_log.append(f"Executing: {statement}")
                 cursor.execute(statement)
                 result = cursor.fetchall()
+
                 if result:
                     columns = [desc[0] for desc in cursor.description]
                     df = pd.DataFrame(result, columns=columns)
-                    results.append(df)
-                    messages.append(f"Query executed successfully with results for '{statement}'.")
+                    actual_rows = len(df)
+                    execution_log.append(f"Actual rows returned: {actual_rows}")
+
+                    results.append({"data": df, "query": statement})
+                    execution_log.append(f"Executed successfully: '{statement}'")
                 else:
-                    messages.append(f"Query executed successfully with no results for '{statement}'.")
-            except pymysql.MySQLError as err:
-                messages.append(f"Error executing statement '{statement}': {err}")
-
+                    results.append({"data": None, "query": statement})
+                    execution_log.append(f"No results for: '{statement}'")
+            except Exception as e:
+                query_error = f"Query execution failed for '{statement}': {str(e)}"
+                execution_log.append(query_error)
+                results.append({"error": query_error, "query": statement})
+    
     finally:
-        connection.close()
-
-    return results, messages
-
+            connection.close()
+    
+    return results, execution_log
 
 # API endpoint to upload queries and download results
 @app.route('/execute_queries', methods=['POST'])
 def handle_execute_queries():
-    # Get the uploaded file and case_number
-    file = request.files.get('file')
-    case_number = request.form.get('case_number')
-    if file is None or case_number is None:
-        return jsonify({'error': 'Missing required parameters'}), 400
-    
-    filename = secure_filename(file.filename)
-    
-    # Read queries from the file
-    script = file.read().decode('utf-8')
-    
-    results, messages = execute_queries(script, case_number)
+    if 'case_number' not in request.form:
+        return jsonify({'error': 'Missing required parameter case_number'}), 400
 
-    if not results:
-        return jsonify({'messsage': 'No results', "execution_log": messages}), 200
-    
-    # Check if results are empty
-    if all(df.empty for df in results):
-        return jsonify({'messsage': 'No data in results', "execution_log": messages}), 200
-    
-    excel_buffer = BytesIO()
+    case_number = request.form['case_number']
 
-    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-        for i, df in enumerate(results, 1):
-            sheet_name = f'Result_{i}'
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
+    try:
+        results, messages = execute_queries(case_number)
 
-    excel_buffer.seek(0)
+        zip_buffer = BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for i, result in enumerate(results, 1):
+                filename = f'query_{i}'
 
-    zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        zip_file.writestr('query_results.xlsx', excel_buffer.getvalue())
+                if 'data' in result and result['data'] is not None:
+                    csv_buffer = StringIO()
+                    result['data'].to_csv(csv_buffer, index=False)
+                    zip_file.writestr(f'{filename}.csv', csv_buffer.getvalue())
+                elif 'error' in result:
+                    error_content = f"Error: {result['error']}\nQuery: {result.get('query', '')[:500]}"
+                    zip_file.writestr(f'{filename}_error.txt', error_content)
+                else:
+                    zip_file.writestr(f'{filename}_empty.txt', "No results for this query")
 
-    zip_buffer.seek(0)
+            zip_file.writestr('execution_log.txt', "\n".join(messages))
 
-    return send_file(
-        zip_buffer,
-        mimetype='application/zip',
-        as_attachment=True,
-        download_name='query_results.zip'
-    )
+        zip_buffer.seek(0)
+
+        return send_file(
+            zip_buffer,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=f'query_results_{case_number}.zip'
+        )
+    except Exception as e:
+        return jsonify({
+            'error': f'Processing failed: {str(e)}',
+            'execution_log': messages if 'messages' in locals() else[]
+        }), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
