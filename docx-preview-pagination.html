@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>DOCX Preview Local</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            background: #f5f5f5;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        #docx-container {
+            background-color: transparent;
+            padding: 20px;
+            max-width: 834px;
+            margin: auto;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .docx-page {
+            width: 794px;    /* A4 width in px at 96dpi */
+            height: 1123px;  /* A4 height in px at 96dpi */
+            margin-bottom: 24px;
+            background-color: white;
+            border: 1px solid #ddd;
+            box-sizing: border-box;
+            position: relative;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* Content container */
+        .page-content {
+            padding: 72px;  /* 1-inch margins */
+            height: calc(100% - 144px); /* Full height minus padding */
+            overflow: hidden;
+            position: relative;
+        }
+
+        /* Hide all pages initially */
+        .docx-page {
+            display: none;
+        }
+
+        /* Show only active page */
+        .docx-page.active {
+            display: flex;
+        }
+        
+        /* Page navigation controls */
+        .page-navigation {
+            display: flex;
+            justify-content: center;
+            margin: 20px 0;
+            gap: 15px;
+        }
+        
+        .page-navigation button {
+            padding: 8px 15px;
+            background: #4285f4;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        
+        .page-navigation button:disabled {
+            background: #cccccc;
+            cursor: not-allowed;
+        }
+        
+        .page-navigation span {
+            display: flex;
+            align-items: center;
+        }
+        
+        /* Loading indicator */
+        .loading-indicator {
+            display: none;
+            margin: 20px 0;
+            text-align: center;
+            font-size: 16px;
+            color: #4285f4;
+        }
+        
+        .loading-indicator.active {
+            display: block;
+        }
+        
+        /* Original content container (hidden) */
+        #original-content {
+            position: absolute;
+            left: -9999px;
+            top: -9999px;
+            visibility: hidden;
+            overflow: visible;
+            width: 794px; /* Same as page width */
+        }
+        
+        /* Page number */
+        .page-number {
+            position: absolute;
+            bottom: 20px;
+            right: 30px;
+            font-size: 12px;
+            color: #888;
+        }
+        
+        /* Temporary element for measuring */
+        #measure-container {
+            position: absolute;
+            left: -9999px;
+            top: -9999px;
+            visibility: hidden;
+            width: 650px; /* Account for margins */
+            overflow: visible;
+        }
+    </style>
+</head>
+<body>
+    <h2>Select a DOCX File</h2>
+    <input type="file" id="upload-docx" accept=".docx" />
+    
+    <div class="loading-indicator" id="loading-indicator">
+        Processing document... This may take a moment.
+    </div>
+    
+    <!-- Page navigation controls -->
+    <div class="page-navigation">
+        <button id="prev-page" disabled>Previous Page</button>
+        <span id="page-counter">Page 0 of 0</span>
+        <button id="next-page" disabled>Next Page</button>
+    </div>
+    
+    <!-- Document container -->
+    <div id="docx-container"></div>
+    
+    <!-- Hidden original content -->
+    <div id="original-content"></div>
+    
+    <!-- Container for measuring elements -->
+    <div id="measure-container"></div>
+
+    <script src="jszip/dist/jszip.min.js"></script>
+    <script src="docx-preview/dist/docx-preview.min.js"></script>
+
+    <script>
+    let currentPage = 1;
+    let totalPages = 0;
+    
+    // Function to update page navigation and visibility
+    function updatePageNavigation() {
+        const prevBtn = document.getElementById("prev-page");
+        const nextBtn = document.getElementById("next-page");
+        const counter = document.getElementById("page-counter");
+        const pages = document.querySelectorAll(".docx-page");
+        
+        prevBtn.disabled = currentPage <= 1;
+        nextBtn.disabled = currentPage >= totalPages;
+        counter.textContent = `Page ${currentPage} of ${totalPages}`;
+        
+        // Update active page
+        pages.forEach((page, index) => {
+            if (index + 1 === currentPage) {
+                page.classList.add('active');
+            } else {
+                page.classList.remove('active');
+            }
+        });
+    }
+    
+    // Event listeners for navigation
+    document.getElementById("prev-page").addEventListener("click", () => {
+        if (currentPage > 1) {
+            currentPage--;
+            updatePageNavigation();
+        }
+    });
+    
+    document.getElementById("next-page").addEventListener("click", () => {
+        if (currentPage < totalPages) {
+            currentPage++;
+            updatePageNavigation();
+        }
+    });
+    
+    // Create a new page
+    function createNewPage() {
+        const page = document.createElement("div");
+        page.className = "docx-page";
+        
+        const content = document.createElement("div");
+        content.className = "page-content";
+        
+        page.appendChild(content);
+        document.getElementById("docx-container").appendChild(page);
+        
+        return { page, content };
+    }
+    
+    // Function to process document with explicit page breaks first
+    function createPaginatedPages() {
+        console.log("Starting two-phase pagination process...");
+        
+        // Constants
+        const PAGE_HEIGHT = 979; // Available content height within page
+        
+        // Get the target container and clear it
+        const container = document.getElementById("docx-container");
+        container.innerHTML = "";
+        
+        // Get the original rendered content
+        const originalContent = document.getElementById("original-content");
+        
+        // Find the main content container
+        const docxContent = originalContent.querySelector(".docx") || 
+                           (originalContent.children.length > 0 ? originalContent.children[0] : null);
+        
+        if (!docxContent) {
+            console.error("No DOCX content found to paginate");
+            return 0;
+        }
+        
+        console.log("Found document content:", docxContent);
+        
+        // PHASE 1: Create pages based on explicit page breaks
+        // -------------------------------------------------
+        
+        // First, find all page breaks in the document
+        const pageBreakElements = [];
+        const pageBreakMarkers = [];
+        
+        // Function to detect page break elements
+        function findPageBreaks(element, depth = 0) {
+            // Skip text nodes and non-element nodes
+            if (element.nodeType !== Node.ELEMENT_NODE) return;
+            
+            // Check if this element is a page break
+            const isBreak = element.classList && (
+                element.classList.contains('docx-page-break') || 
+                element.classList.contains('lastRenderedPageBreak') ||
+                element.getAttribute('data-page-break') === 'true' ||
+                element.getAttribute('style')?.includes('page-break')
+            );
+            
+            if (isBreak) {
+                console.log("Found page break element:", element);
+                pageBreakElements.push(element);
+                
+                // Create a marker that we'll use to split content
+                const marker = document.createElement('div');
+                marker.className = 'page-break-marker';
+                marker.setAttribute('data-page-break', 'true');
+                marker.style.display = 'none';
+                
+                // Insert marker right after the page break element
+                if (element.parentNode) {
+                    element.parentNode.insertBefore(marker, element.nextSibling);
+                    pageBreakMarkers.push(marker);
+                }
+            }
+            
+            // Recursively check all children
+            Array.from(element.children).forEach(child => {
+                findPageBreaks(child, depth + 1);
+            });
+        }
+        
+        // Find all page breaks in the document
+        findPageBreaks(docxContent);
+        console.log(`Found ${pageBreakElements.length} explicit page breaks`);
+        
+        // Measurement container
+        const measureContainer = document.getElementById("measure-container");
+        
+        // Function to measure element height
+        function measureElementHeight(element) {
+            measureContainer.innerHTML = "";
+            const clone = element.cloneNode(true);
+            measureContainer.appendChild(clone);
+            const height = measureContainer.scrollHeight;
+            measureContainer.innerHTML = "";
+            return height;
+        }
+        
+        // Create the initial page
+        let pageInfo = createNewPage();
+        let currentPage = pageInfo.page;
+        let currentPageContent = pageInfo.content;
+        let currentPageHeight = 0;
+        let pageCount = 1;
+        
+        // Split content at page break markers and create initial pages
+        function splitContentAtBreaks() {
+            // Clone the content to work with
+            const contentClone = docxContent.cloneNode(true);
+            
+            // Find all page break markers in the cloned content
+            const markers = contentClone.querySelectorAll('.page-break-marker');
+            
+            if (markers.length === 0 && pageBreakMarkers.length > 0) {
+                console.warn("Marker mismatch: Original had markers but clone doesn't");
+            }
+            
+            console.log(`Found ${markers.length} page break markers in cloned content`);
+            
+            // Array to hold content segments (content between page breaks)
+            const segments = [];
+            
+            // If there are markers, split the content at those points
+            if (markers.length > 0) {
+                // Create segment container
+                let segmentContainer = document.createElement('div');
+                
+                // Process all child nodes
+                let currentNode = contentClone.firstChild;
+                
+                while (currentNode) {
+                    const nextNode = currentNode.nextSibling;
+                    
+                    // If this is a page break marker, start a new segment
+                    if (currentNode.nodeType === Node.ELEMENT_NODE && 
+                        currentNode.classList && 
+                        currentNode.classList.contains('page-break-marker')) {
+                        
+                        // Add current segment to segments array (if not empty)
+                        if (segmentContainer.childNodes.length > 0) {
+                            segments.push(segmentContainer);
+                        }
+                        
+                        // Create new segment container
+                        segmentContainer = document.createElement('div');
+                    } 
+                    // If this is a page break element, skip it
+                    else if (currentNode.nodeType === Node.ELEMENT_NODE && 
+                            currentNode.classList && 
+                            currentNode.classList.contains('docx-page-break')) {
+                        // Skip this node
+                    }
+                    // Otherwise, add the node to the current segment
+                    else {
+                        // Clone the node and add to segment
+                        segmentContainer.appendChild(currentNode.cloneNode(true));
+                    }
+                    
+                    currentNode = nextNode;
+                }
+                
+                // Add the last segment if not empty
+                if (segmentContainer.childNodes.length > 0) {
+                    segments.push(segmentContainer);
+                }
+            } 
+            // If no markers were found, treat the whole content as one segment
+            else {
+                segments.push(contentClone);
+            }
+            
+            console.log(`Created ${segments.length} content segments based on page breaks`);
+            return segments;
+        }
+        
+        // Get content segments based on page breaks
+        const segments = splitContentAtBreaks();
+        
+        // PHASE 2: Process each segment with content overflow pagination
+        // -------------------------------------------------
+        
+        // Function to extract child elements until a given height is reached
+        function extractChildrenUpToHeight(element, maxHeight) {
+            const container = document.createElement('div');
+            
+            // Copy all attributes
+            if (element.nodeType === Node.ELEMENT_NODE) {
+                Array.from(element.attributes || []).forEach(attr => {
+                    container.setAttribute(attr.name, attr.value);
+                });
+            }
+            
+            const children = Array.from(element.childNodes);
+            let heightSoFar = 0;
+            let index = 0;
+            
+            // Add children until we reach the max height
+            while (index < children.length) {
+                const child = children[index];
+                const childClone = child.cloneNode(true);
+                container.appendChild(childClone);
+                
+                // Measure the container height
+                const newHeight = measureElementHeight(container);
+                
+                // If adding this child exceeds the max height, remove it and stop
+                if (newHeight > maxHeight && container.childNodes.length > 1) {
+                    container.removeChild(container.lastChild);
+                    break;
+                }
+                
+                heightSoFar = newHeight;
+                index++;
+            }
+            
+            return {
+                container,
+                processedCount: index,
+                height: heightSoFar
+            };
+        }
+        
+        // Function to create a remainder element with the children that didn't fit
+        function createRemainderElement(element, processedCount) {
+            const container = document.createElement('div');
+            
+            // Copy all attributes
+            if (element.nodeType === Node.ELEMENT_NODE) {
+                Array.from(element.attributes || []).forEach(attr => {
+                    container.setAttribute(attr.name, attr.value);
+                });
+            }
+            
+            const children = Array.from(element.childNodes);
+            
+            // Add the remaining children
+            for (let i = processedCount; i < children.length; i++) {
+                container.appendChild(children[i].cloneNode(true));
+            }
+            
+            return container;
+        }
+        
+        // Process each segment with overflow pagination
+        segments.forEach((segment, segmentIndex) => {
+            console.log(`Processing segment ${segmentIndex + 1} of ${segments.length}`);
+            
+            const segmentHeight = measureElementHeight(segment);
+            console.log(`Segment height: ${segmentHeight}px`);
+            
+            // If this segment is the start of a new page (not the first segment)
+            if (segmentIndex > 0) {
+                // Create a new page for this segment
+                pageInfo = createNewPage();
+                currentPage = pageInfo.page;
+                currentPageContent = pageInfo.content;
+                currentPageHeight = 0;
+                pageCount++;
+            }
+            
+            // If segment fits on current page, add it directly
+            if (segmentHeight <= PAGE_HEIGHT) {
+                currentPageContent.appendChild(segment.cloneNode(true));
+                currentPageHeight += segmentHeight;
+            } 
+            // Otherwise, paginate this segment
+            else {
+                console.log(`Segment ${segmentIndex + 1} needs pagination (${segmentHeight}px > ${PAGE_HEIGHT}px)`);
+                
+                // Available space on current page
+                let spaceLeft = PAGE_HEIGHT - currentPageHeight;
+                
+                // Process segment content by extracting what fits
+                let remainingContent = segment;
+                
+                while (remainingContent.childNodes.length > 0) {
+                    // If we're at the start of a page, use full page height
+                    if (currentPageHeight === 0) {
+                        spaceLeft = PAGE_HEIGHT;
+                    }
+                    
+                    // Extract content that fits on current page
+                    const extracted = extractChildrenUpToHeight(remainingContent, spaceLeft);
+                    
+                    if (extracted.processedCount > 0) {
+                        currentPageContent.appendChild(extracted.container);
+                        currentPageHeight += extracted.height;
+                    }
+                    
+                    // If there's more content to process
+                    if (extracted.processedCount < remainingContent.childNodes.length) {
+                        // Create new page
+                        pageInfo = createNewPage();
+                        currentPage = pageInfo.page;
+                        currentPageContent = pageInfo.content;
+                        currentPageHeight = 0;
+                        pageCount++;
+                        
+                        // Create remainder element for next page
+                        remainingContent = createRemainderElement(remainingContent, extracted.processedCount);
+                    } else {
+                        // All content processed
+                        break;
+                    }
+                }
+            }
+        });
+        
+        // Add page numbers
+        const pages = document.querySelectorAll(".docx-page");
+        pages.forEach((page, index) => {
+            const pageNum = document.createElement("div");
+            pageNum.className = "page-number";
+            pageNum.textContent = `${index + 1} / ${pageCount}`;
+            page.appendChild(pageNum);
+        });
+        
+        console.log(`Pagination complete: ${pageCount} pages created`);
+        totalPages = pageCount;
+        currentPage = 1;
+        
+        return pageCount;
+    }
+    
+    // Handle file upload
+    document.getElementById("upload-docx").addEventListener("change", async function(event) {
+        const file = event.target.files[0];
+        if (!file || !file.name.endsWith(".docx")) {
+            alert("Please upload a valid DOCX file.");
+            return;
+        }
+        
+        try {
+            // Show loading indicator
+            document.getElementById("loading-indicator").classList.add("active");
+            
+            // Clear containers
+            document.getElementById("original-content").innerHTML = "";
+            document.getElementById("docx-container").innerHTML = "";
+            document.getElementById("measure-container").innerHTML = "";
+            
+            // Step 1: Render the document with page breaks enabled to a hidden container
+            console.log("Rendering original document...");
+            const arrayBuffer = await file.arrayBuffer();
+            await docx.renderAsync(
+                arrayBuffer, 
+                document.getElementById("original-content"), 
+                null, 
+                {
+                    className: "docx",
+                    inWrapper: true,
+                    breakPages: true,  // Enable page breaking to capture explicit breaks
+                    ignoreLastRenderedPageBreak: false, // Don't ignore page breaks
+                    ignoreWidth: false,
+                    ignoreHeight: true,  // Allow content to flow for measurement
+                    useBase64URL: true,
+                    debug: true
+                }
+            );
+            
+            // Step 2: Create paginated version with proper page breaks
+            console.log("Starting pagination process...");
+            // Use setTimeout to ensure the DOM has updated
+            setTimeout(() => {
+                try {
+                    const pageCount = createPaginatedPages();
+                    
+                    if (pageCount > 0) {
+                        console.log(`Successfully created ${pageCount} pages`);
+                        updatePageNavigation();
+                    } else {
+                        console.error("Pagination failed - no pages created");
+                        alert("Failed to paginate document.");
+                    }
+                } catch (error) {
+                    console.error("Error during pagination:", error);
+                    alert("Error during pagination: " + error.message);
+                }
+                
+                // Hide loading indicator
+                document.getElementById("loading-indicator").classList.remove("active");
+            }, 1500); // Increased timeout to ensure rendering is complete
+            
+        } catch (err) {
+            console.error("Error rendering DOCX:", err);
+            alert("Failed to render DOCX: " + err.message);
+            
+            // Hide loading indicator
+            document.getElementById("loading-indicator").classList.remove("active");
+        }
+    });
+    
+    // Keyboard navigation
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+            document.getElementById("prev-page").click();
+        } else if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+            document.getElementById("next-page").click();
+        }
+    });
+    </script>
+</body>
+</html>
